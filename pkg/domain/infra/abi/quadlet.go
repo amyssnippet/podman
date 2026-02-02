@@ -335,20 +335,46 @@ func (ic *ContainerEngine) installQuadlet(_ context.Context, path, destName, ins
 		return "", fmt.Errorf("%q is not a supported Quadlet file type", filepath.Ext(finalPath))
 	}
 
-	osFlags := os.O_CREATE | os.O_WRONLY
+	var destFile *os.File
+	var tempPath string
 
+	// LOGIC SPLIT:
+	// Case 1: !replace. Use O_EXCL for atomic "fail if exists".
+	// Case 2: replace. Use TempFile + Rename for atomic replacement.
 	if !replace {
-		osFlags |= os.O_EXCL
+		var err error
+		// O_EXCL ensures we fail if the file exists, avoiding the Race Condition (TOCTOU)
+		destFile, err = os.OpenFile(finalPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
+		if err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				return "", fmt.Errorf("a Quadlet with name %s already exists, refusing to overwrite", filepath.Base(finalPath))
+			}
+			return "", fmt.Errorf("unable to open file %s: %w", finalPath, err)
+		}
+		// No temp file to clean up or rename later
+	} else {
+		// Create a temp file in the same directory as the destination
+		var err error
+		destFile, err = os.CreateTemp(filepath.Dir(finalPath), "quadlet-install-*")
+		if err != nil {
+			return "", fmt.Errorf("unable to create temp file: %w", err)
+		}
+		tempPath = destFile.Name()
 	}
 
-	file, err := os.OpenFile(finalPath, osFlags, 0o644)
-	if err != nil {
-		if errors.Is(err, fs.ErrExist) && !replace {
-			return "", fmt.Errorf("a Quadlet with name %s already exists, refusing to overwrite", filepath.Base(finalPath))
+	// Ensure we close the file handle (and remove temp if we crash early)
+	defer func() {
+		destFile.Close()
+		// If we are in 'replace' mode and failed before renaming, clean up the temp file
+		if tempPath != "" {
+			// If the rename didn't happen, this cleans up.
+			// If rename happened, Remove returns an error which we ignore or check context.
+			// A simple check is to Stat the tempPath; if it still exists, remove it.
+			if _, err := os.Stat(tempPath); err == nil {
+				os.Remove(tempPath)
+			}
 		}
-		return "", fmt.Errorf("unable to open file %s: %w", filepath.Base(finalPath), err)
-	}
-	defer file.Close()
+	}()
 
 	// Move the file in
 	srcFile, err := os.Open(path)
@@ -357,9 +383,29 @@ func (ic *ContainerEngine) installQuadlet(_ context.Context, path, destName, ins
 	}
 	defer srcFile.Close()
 
-	err = fileutils.ReflinkOrCopy(srcFile, file)
+	err = fileutils.ReflinkOrCopy(srcFile, destFile)
 	if err != nil {
 		return "", fmt.Errorf("unable to copy file from %s to %s: %w", path, finalPath, err)
+	}
+
+	// Explicitly close before rename/chmod to flush writes
+	destFile.Close()
+
+	// If we used a temp file (Replace mode), now we finalize it
+	if tempPath != "" {
+		// Ensure permissions are correct (0644)
+		if err := os.Chmod(tempPath, 0o644); err != nil {
+			return "", fmt.Errorf("unable to set permissions on temp file: %w", err)
+		}
+
+		// Atomic rename overwriting the destination
+		if err := os.Rename(tempPath, finalPath); err != nil {
+			return "", fmt.Errorf("unable to rename temp file to %s: %w", finalPath, err)
+		}
+
+		// Clear tempPath so the defer cleanup doesn't try to remove the now-valid file
+		// (Though strictly speaking, Rename moves it, so the path at tempPath is gone anyway)
+		tempPath = ""
 	}
 
 	// When we install files using this function, caller of this function can turn off `validateQuadletFile`
@@ -384,6 +430,14 @@ func (ic *ContainerEngine) installQuadlet(_ context.Context, path, destName, ins
 // appendStringToFile appends the given text to the specified file.
 // If the file does not exist, it will be created with 0644 permissions.
 func appendStringToFile(filePath, text string) error {
+	content, err := os.ReadFile(filePath)
+	if err == nil {
+		// If file exists, check if it already has the line
+		if string(content) == text {
+			return nil
+		}
+	}
+
 	f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
